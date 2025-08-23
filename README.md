@@ -54,13 +54,8 @@ See `docs/wiring_guide.md` for detailed connection instructions.
 
 - `src/`: Main source code
 - `include/`: Configuration files
-- `test/`: Unit tests
 - `hardware/`: Schematics and PCB designs
 - `docs/`: Documentation
-
-## Contributing
-
-Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.
 
 ## License
 
@@ -71,3 +66,7 @@ This project is licensed under the MIT License - see the LICENSE.md file for det
 - Espressif for the ESP32 platform
 - Cytron Technologies for the MD10C motor driver
 - FreeRTOS for the real-time operating system
+
+## Author
+Anis Mulla  
+[GitHub Profile](https://github.com/AnisMulla9740)
