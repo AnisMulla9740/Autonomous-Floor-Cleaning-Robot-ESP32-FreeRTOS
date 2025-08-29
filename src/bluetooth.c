@@ -14,9 +14,17 @@ extern robot_state_t current_state;
 
 // Bluetooth callbacks
 void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
-    if(event == ESP_SPP_DATA_IND_EVT) {
-        char *data = (char *)param->data_ind.data;
-        xQueueSend(command_queue, data, 0);
+    switch(event) {
+        case ESP_SPP_SRV_OPEN_EVT:
+            send_bt_data("ROBOT:READY");
+            break;
+
+        case ESP_SPP_DATA_IND_EVT:
+            xQueueSend(command_queue, param->data_ind.data, 0);
+            break;
+
+        default:
+            break;
     }
 }
 
