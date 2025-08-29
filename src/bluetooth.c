@@ -39,8 +39,12 @@ void bluetooth_init(void) {
 }
 
 void send_bt_data(const char *data) {
-    printf("BT: %s\n", data);
+    if (spp_client_handle != 0) {   // handle set on connect
+        esp_spp_write(spp_client_handle, strlen(data), (uint8_t *)data);
+    }
+    printf("BT: %s\n", data);  // still print locally
 }
+
 
 void bluetooth_task(void *pvParameters) {
     char command[20];
