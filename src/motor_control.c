@@ -1,157 +1,116 @@
-#include "motor_control.h"
+#include "sensors.h"
 #include "config.h"
-#include <driver/ledc.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 
-// External variables
-extern volatile uint32_t encoder_a_count;
-extern volatile uint32_t encoder_b_count;
-extern pid_controller_t pid_left, pid_right;
+// External FreeRTOS queue for inter-task communication
+extern QueueHandle_t sensor_queue;
 
-void motor_control_init(void) {
-    // Configure motor control pins for Cytron MD10C
-    gpio_set_direction(MOTOR_A_DIR, GPIO_MODE_OUTPUT);
-    gpio_set_direction(MOTOR_B_DIR, GPIO_MODE_OUTPUT);
+/**
+ * @brief Initialize ultrasonic sensor GPIO pins
+ * 
+ * @param trig_pin GPIO used for trigger pulse
+ * @param echo_pin GPIO used for echo measurement
+ */
+void ultrasonic_init(gpio_num_t trig_pin, gpio_num_t echo_pin) {
+    // Trigger is OUTPUT
+    gpio_set_direction(trig_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(trig_pin, 0);
 
-    // Configure PWM for Cytron MD10C
-    ledc_timer_config_t timer_conf = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_10_BIT,
-        .timer_num = LEDC_TIMER_0,
-        .freq_hz = PWM_FREQ,
-    };
-    ledc_timer_config(&timer_conf);
-
-    ledc_channel_config_t channel_conf = {
-        .gpio_num = MOTOR_A_PWM,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .timer_sel = LEDC_TIMER_0,
-        .duty = 0
-    };
-    ledc_channel_config(&channel_conf);
-
-    channel_conf.gpio_num = MOTOR_B_PWM;
-    channel_conf.channel = LEDC_CHANNEL_1;
-    ledc_channel_config(&channel_conf);
+    // Echo is INPUT with pulldown
+    gpio_set_direction(echo_pin, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(echo_pin, GPIO_PULLDOWN_ONLY);
 }
 
-void set_motor_speed(uint8_t duty_cycle) {
-    duty_cycle = duty_cycle > 100 ? 100 : duty_cycle;
-    uint32_t duty = (duty_cycle * 1023) / 100;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-}
+/**
+ * @brief Measure distance from ultrasonic sensor
+ * 
+ * @param trig_pin GPIO trigger pin
+ * @param echo_pin GPIO echo pin
+ * @param distance Pointer to store result in cm
+ * @return true if valid measurement, false if timeout/error
+ */
+bool get_distance(gpio_num_t trig_pin, gpio_num_t echo_pin, uint16_t *distance) {
+    uint32_t timeout = 0;
 
-void set_movement(movement_state_t state) {
-    switch(state) {
-        case MOVEMENT_FORWARD:
-            gpio_set_level(MOTOR_A_DIR, 1);
-            gpio_set_level(MOTOR_B_DIR, 1);
-            break;
-        case MOVEMENT_BACKWARD:
-            gpio_set_level(MOTOR_A_DIR, 0);
-            gpio_set_level(MOTOR_B_DIR, 0);
-            break;
-        case MOVEMENT_LEFT:
-            gpio_set_level(MOTOR_A_DIR, 0);
-            gpio_set_level(MOTOR_B_DIR, 1);
-            break;
-        case MOVEMENT_RIGHT:
-            gpio_set_level(MOTOR_A_DIR, 1);
-            gpio_set_level(MOTOR_B_DIR, 0);
-            break;
-        case MOVEMENT_STOP:
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-            break;
+    // Generate 10us trigger pulse
+    gpio_set_level(trig_pin, 0);
+    ets_delay_us(2);
+    gpio_set_level(trig_pin, 1);
+    ets_delay_us(10);
+    gpio_set_level(trig_pin, 0);
+
+    // Wait for echo HIGH (start)
+    timeout = 0;
+    while(gpio_get_level(echo_pin) == 0) {
+        if(++timeout > 10000) return false;   // timeout ~10 ms
+        ets_delay_us(1);
     }
-}
+    uint32_t start_time = esp_timer_get_time();
 
-void encoder_init(void) {
-    gpio_set_direction(ENCODER_A_PIN, GPIO_MODE_INPUT);
-    gpio_set_direction(ENCODER_B_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(ENCODER_A_PIN, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(ENCODER_B_PIN, GPIO_PULLUP_ONLY);
-    
-    // Install ISR service
-    gpio_install_isr_service(0);
-    
-    // Configure interrupts for encoder pins
-    gpio_set_intr_type(ENCODER_A_PIN, GPIO_INTR_POSEDGE);
-    gpio_set_intr_type(ENCODER_B_PIN, GPIO_INTR_POSEDGE);
-    
-    // Add ISR handlers
-    gpio_isr_handler_add(ENCODER_A_PIN, encoder_a_isr, NULL);
-    gpio_isr_handler_add(ENCODER_B_PIN, encoder_b_isr, NULL);
-}
-
-void IRAM_ATTR encoder_a_isr(void *arg) {
-    encoder_a_count++;
-}
-
-void IRAM_ATTR encoder_b_isr(void *arg) {
-    encoder_b_count++;
-}
-
-void calculate_speed(float *left_speed, float *right_speed) {
-    static uint32_t last_encoder_a = 0;
-    static uint32_t last_encoder_b = 0;
-    static uint64_t last_time = 0;
-    
-    uint64_t current_time = esp_timer_get_time();
-    uint32_t elapsed_time = current_time - last_time;
-    
-    if(elapsed_time > 100000) {
-        *left_speed = (encoder_a_count - last_encoder_a) * WHEEL_CIRCUMFERENCE / 
-                     (ENCODER_PPR * (elapsed_time / 1000000.0));
-        *right_speed = (encoder_b_count - last_encoder_b) * WHEEL_CIRCUMFERENCE / 
-                      (ENCODER_PPR * (elapsed_time / 1000000.0));
-        
-        last_encoder_a = encoder_a_count;
-        last_encoder_b = encoder_b_count;
-        last_time = current_time;
+    // Wait for echo LOW (end)
+    timeout = 0;
+    while(gpio_get_level(echo_pin) == 1) {
+        if(++timeout > 60000) return false;  // timeout ~60 ms
+        ets_delay_us(1);
     }
+    uint32_t end_time = esp_timer_get_time();
+
+    // Calculate distance (time/58 = cm)
+    *distance = (end_time - start_time) / 58;
+    
+    // Clamp value to maximum limit
+    if(*distance > MAX_DISTANCE) {
+        *distance = MAX_DISTANCE;
+    }
+
+    return true;
 }
 
-void pid_init(pid_controller_t *pid, float kp, float ki, float kd, float setpoint) {
-    pid->kp = kp;
-    pid->ki = ki;
-    pid->kd = kd;
-    pid->setpoint = setpoint;
-    pid->integral = 0;
-    pid->previous_error = 0;
+/**
+ * @brief Initialize all ultrasonic sensors
+ */
+void sensors_init(void) {
+    ultrasonic_init(TRIG_PIN_FRONT, ECHO_PIN_FRONT);
+    ultrasonic_init(TRIG_PIN_LEFT, ECHO_PIN_LEFT);
+    ultrasonic_init(TRIG_PIN_RIGHT, ECHO_PIN_RIGHT);
 }
 
-float pid_update(pid_controller_t *pid, float current_value) {
-    float error = pid->setpoint - current_value;
-    pid->integral += error;
-    float derivative = error - pid->previous_error;
-    pid->previous_error = error;
-    
-    return (pid->kp * error) + (pid->ki * pid->integral) + (pid->kd * derivative);
-}
+/**
+ * @brief FreeRTOS task to read all sensors periodically
+ * 
+ * This task:
+ *  - Reads distances from all sensors
+ *  - Sets error_flags if any read fails
+ *  - Sends data to sensor_queue
+ */
+void sensor_task(void *pvParameters) {
+    sensor_data_t sensor_data;
 
-void motor_control_task(void *pvParameters) {
-    float left_speed = 0, right_speed = 0;
-    float left_output = 0, right_output = 0;
-    
-    pid_init(&pid_left, KP, KI, KD, 30.0);
-    pid_init(&pid_right, KP, KI, KD, 30.0);
-    
     while(1) {
-        calculate_speed(&left_speed, &right_speed);
-        
-        left_output = pid_update(&pid_left, left_speed);
-        right_output = pid_update(&pid_right, right_speed);
-        
-        set_motor_speed(70 + (uint8_t)left_output);
-        
-        vTaskDelay(pdMS_TO_TICKS(50));
+        sensor_data.error_flags = 0;  // reset errors
+
+        // FRONT sensor
+        if(!get_distance(TRIG_PIN_FRONT, ECHO_PIN_FRONT, &sensor_data.front_distance)) {
+            sensor_data.error_flags |= 0x01;  // set bit0 if error
+        }
+
+        // LEFT sensor
+        if(!get_distance(TRIG_PIN_LEFT, ECHO_PIN_LEFT, &sensor_data.left_distance)) {
+            sensor_data.error_flags |= 0x02;  // set bit1 if error
+        }
+
+        // RIGHT sensor
+        if(!get_distance(TRIG_PIN_RIGHT, ECHO_PIN_RIGHT, &sensor_data.right_distance)) {
+            sensor_data.error_flags |= 0x04;  // set bit2 if error
+        }
+
+        // Send results to queue (non-blocking)
+        xQueueOverwrite(sensor_queue, &sensor_data);
+
+        // Run every 100 ms
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
